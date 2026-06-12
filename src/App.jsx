@@ -178,6 +178,7 @@ async function getState(){
   if(!res.ok)throw new Error("request failed");
   return res.json();
 }
+// Fire-and-forget write — doesn't return state, just {ok:true}
 async function sendOp(type,payload){
   const res=await fetch("/api/state",{
     method:"POST",
@@ -186,7 +187,7 @@ async function sendOp(type,payload){
   });
   if(res.status===401){const e=new Error("locked");e.code=401;throw e;}
   if(!res.ok)throw new Error("request failed");
-  return res.json();
+  return res.json(); // {ok:true}
 }
 
 /* ---- media upload ---- */
@@ -364,37 +365,68 @@ export default function App(){
   const [composing,setComposing]=useState(false);
   const [editing,setEditing]=useState(false);
   const [pasteMode,setPasteMode]=useState(false);
-  const pendingRef=useRef(0);
-  const lastOpAt=useRef(0);
-  const STALE_MS=4000;
+  // localRef mirrors posts/stamps so the poll can diff without stale closures
+  const localRef=useRef({posts:[],stamps:[]});
+  const writingRef=useRef(0); // count of in-flight writes
 
-  const applyState=useCallback((s)=>{
-    setPosts((s.posts||[]).slice().sort((a,b)=>(b.ts||0)-(a.ts||0)));
-    setStamps(s.stamps||[]);
+  // Merge server state into local: keep local version of things we just wrote,
+  // take server version for everything else (i.e. the other person's changes).
+  const mergeServer=useCallback((server)=>{
+    setPosts(prev=>{
+      const localById=Object.fromEntries(prev.map(p=>[p.id,p]));
+      const serverById=Object.fromEntries((server.posts||[]).map(p=>[p.id,p]));
+      // union of ids, prefer local copy when it exists (we own those writes)
+      const allIds=[...new Set([...Object.keys(localById),...Object.keys(serverById)])];
+      const merged=allIds
+        .map(id=>localById[id]||serverById[id])
+        .filter(Boolean)
+        .sort((a,b)=>(b.ts||0)-(a.ts||0));
+      localRef.current.posts=merged;
+      return merged;
+    });
+    setStamps(prev=>{
+      const localIds=new Set(prev.map(s=>s.id));
+      const serverStamps=server.stamps||[];
+      // add any stamps from server we don't have; keep all local stamps
+      const extra=serverStamps.filter(s=>!localIds.has(s.id));
+      const merged=[...prev,...extra];
+      localRef.current.stamps=merged;
+      return merged;
+    });
   },[]);
 
   const refresh=useCallback(async()=>{
-    if(pendingRef.current>0)return;
-    if(Date.now()-lastOpAt.current<STALE_MS)return;
-    try{applyState(await getState());setLocked(false);}
-    catch(e){if(e.code===401)setLocked(true);}
-  },[applyState]);
+    if(writingRef.current>0)return; // don't poll while a write is in flight
+    try{
+      const server=await getState();
+      setLocked(false);
+      mergeServer(server);
+    }catch(e){if(e.code===401)setLocked(true);}
+  },[mergeServer]);
 
   useEffect(()=>{
-    (async()=>{await refresh();setLoading(false);})();
-    const iv=setInterval(refresh,6000);
+    (async()=>{
+      try{
+        const server=await getState();
+        setPosts((server.posts||[]).sort((a,b)=>(b.ts||0)-(a.ts||0)));
+        setStamps(server.stamps||[]);
+        localRef.current={posts:server.posts||[],stamps:server.stamps||[]};
+      }catch(e){if(e.code===401)setLocked(true);}
+      setLoading(false);
+    })();
+    const iv=setInterval(refresh,7000);
     const onFocus=()=>refresh();
     window.addEventListener("focus",onFocus);
     return()=>{clearInterval(iv);window.removeEventListener("focus",onFocus);};
   },[refresh]);
 
-  const op=useCallback(async(type,payload)=>{
-    pendingRef.current+=1;
-    lastOpAt.current=Date.now();
-    try{applyState(await sendOp(type,payload));lastOpAt.current=Date.now();}
-    catch(e){if(e.code===401)setLocked(true);}
-    finally{pendingRef.current=Math.max(0,pendingRef.current-1);}
-  },[applyState]);
+  // op: update local state instantly, then write to server in background
+  const op=useCallback((type,payload)=>{
+    writingRef.current+=1;
+    sendOp(type,payload)
+      .catch(e=>{if(e.code===401)setLocked(true);})
+      .finally(()=>{writingRef.current=Math.max(0,writingRef.current-1);});
+  },[]);
 
   const saveProfile=useCallback((p)=>{
     const prof={name:p.name.trim().slice(0,22),mascot:p.mascot,color:p.color};
@@ -404,40 +436,45 @@ export default function App(){
 
   const addPost=useCallback((data)=>{
     const post={...data,id:uid(),author:me.name,ts:Date.now(),hearts:[],comments:[]};
-    setPosts((p)=>[post,...p]);setComposing(false);op("addPost",post);
+    setPosts((p)=>{const n=[post,...p];localRef.current.posts=n;return n;});
+    setComposing(false);
+    op("addPost",post);
   },[me,op]);
 
   const toggleHeart=useCallback((post)=>{
     const has=post.hearts.includes(me.name);
     const hearts=has?post.hearts.filter((h)=>h!==me.name):[...post.hearts,me.name];
-    setPosts((p)=>p.map((x)=>(x.id===post.id?{...x,hearts}:x)));
+    setPosts((p)=>{const n=p.map((x)=>(x.id===post.id?{...x,hearts}:x));localRef.current.posts=n;return n;});
     op("heart",{id:post.id,name:me.name});
   },[me,op]);
 
   const addComment=useCallback((post,text)=>{
     const comment={id:uid(3),author:me.name,text,ts:Date.now()};
-    setPosts((p)=>p.map((x)=>(x.id===post.id?{...x,comments:[...(x.comments||[]),comment]}:x)));
+    setPosts((p)=>{const n=p.map((x)=>(x.id===post.id?{...x,comments:[...(x.comments||[]),comment]}:x));localRef.current.posts=n;return n;});
     op("addComment",{id:post.id,comment});
   },[me,op]);
 
   const removeComment=useCallback((post,cid)=>{
-    setPosts((p)=>p.map((x)=>(x.id===post.id?{...x,comments:(x.comments||[]).filter((c)=>c.id!==cid)}:x)));
+    setPosts((p)=>{const n=p.map((x)=>(x.id===post.id?{...x,comments:(x.comments||[]).filter((c)=>c.id!==cid)}:x));localRef.current.posts=n;return n;});
     op("delComment",{id:post.id,cid});
   },[op]);
 
   const removePost=useCallback((post)=>{
     if(!window.confirm("Take this down? This can't be undone."))return;
-    setPosts((p)=>p.filter((x)=>x.id!==post.id));op("delPost",{id:post.id});
+    setPosts((p)=>{const n=p.filter((x)=>x.id!==post.id);localRef.current.posts=n;return n;});
+    op("delPost",{id:post.id});
   },[op]);
 
   const placeStamp=useCallback((e)=>{
     const stamp={id:uid(),author:me.name,mascot:me.mascot,color:me.color,
       x:(e.clientX/window.innerWidth)*100,y:(e.clientY/window.innerHeight)*100};
-    setStamps((s)=>[...s,stamp]);op("addStamp",stamp);
+    setStamps((s)=>{const n=[...s,stamp];localRef.current.stamps=n;return n;});
+    op("addStamp",stamp);
   },[me,op]);
 
   const removeStamp=useCallback((id)=>{
-    setStamps((s)=>s.filter((x)=>x.id!==id));op("delStamp",{id});
+    setStamps((s)=>{const n=s.filter((x)=>x.id!==id);localRef.current.stamps=n;return n;});
+    op("delStamp",{id});
   },[op]);
 
   const other=useMemo(()=>{
