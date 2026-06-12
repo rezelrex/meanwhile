@@ -1,5 +1,12 @@
 const { put } = require("@vercel/blob");
 
+module.exports.config = {
+  api: {
+    bodyParser: false,
+    responseLimit: false,
+  },
+};
+
 module.exports = async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -17,19 +24,25 @@ module.exports = async function handler(req, res) {
 
   const token = process.env.BLOB_READ_WRITE_TOKEN;
   if (!token) {
-    return res.status(500).json({ error: "BLOB_READ_WRITE_TOKEN not set. Connect a Blob store in your Vercel project dashboard then redeploy." });
+    return res.status(500).json({ error: "BLOB_READ_WRITE_TOKEN not set." });
   }
 
   try {
+    const chunks = [];
+    await new Promise((resolve, reject) => {
+      req.on("data", (chunk) => chunks.push(chunk));
+      req.on("end", resolve);
+      req.on("error", reject);
+    });
+    const buffer = Buffer.concat(chunks);
+
+    if (buffer.length === 0) {
+      return res.status(400).json({ error: "Empty file received" });
+    }
+
     const rawName = req.headers["x-filename"] || ("upload-" + Date.now());
     const filename = rawName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80);
     const contentType = (req.headers["content-type"] || "application/octet-stream").split(";")[0].trim();
-
-    const chunks = [];
-    for await (const chunk of req) chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
-    const buffer = Buffer.concat(chunks);
-
-    if (buffer.length === 0) return res.status(400).json({ error: "Empty file received" });
 
     const blob = await put("media/" + filename, buffer, {
       access: "public",
@@ -40,7 +53,7 @@ module.exports = async function handler(req, res) {
 
     return res.status(200).json({ url: blob.url });
   } catch (e) {
-    console.error("upload error:", e && e.message);
+    console.error("upload error:", e && e.message, e && e.stack);
     return res.status(500).json({ error: (e && e.message) || String(e) });
   }
 };
