@@ -54,10 +54,7 @@ function apply(s, type, p) {
     }
   } else if (type === "addComment") {
     const post = findPost(p.id);
-    if (post) {
-      post.comments = post.comments || [];
-      post.comments.push(p.comment);
-    }
+    if (post) { post.comments = post.comments || []; post.comments.push(p.comment); }
   } else if (type === "delComment") {
     const post = findPost(p.id);
     if (post) post.comments = (post.comments || []).filter((c) => c.id !== p.cid);
@@ -88,8 +85,7 @@ module.exports = async function handler(req, res) {
 
   try {
     if (req.method === "GET") {
-      const state = await readState();
-      return res.status(200).json(state);
+      return res.status(200).json(await readState());
     }
     if (req.method === "POST") {
       const body = await parseBody(req);
