@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { Plus, Heart, X, MapPin, Trash2, Camera, Loader2, Moon, Send, Sticker, Check, Lock } from "lucide-react";
+import { createClient } from "@supabase/supabase-js";
 
 /* ------------------------------------------------------------------ *
  * Meanwhile — a soft little window for two.
@@ -210,23 +211,44 @@ function when(ts) {
 
 /* ---- local profile (who am I on this device) ---- */
 function loadProfile() { try { return JSON.parse(localStorage.getItem("mw:profile") || "null"); } catch { return null; } }
-function saveProfileLS(p) { try { localStorage.setItem("mw:profile", JSON.stringify(p)); } catch {} }
+function saveProfileLS(p) {
+  try {
+    const prev = JSON.parse(localStorage.getItem("mw:mynames") || "[]");
+    const next = [...new Set([...prev, p.name])];
+    localStorage.setItem("mw:mynames", JSON.stringify(next));
+    localStorage.setItem("mw:profile", JSON.stringify(p));
+  } catch {}
+}
+function loadMyNames() { try { return new Set(JSON.parse(localStorage.getItem("mw:mynames") || "[]")); } catch { return new Set(); } }
 function getRoom() { try { return localStorage.getItem("mw:room") || ""; } catch { return ""; } }
 function setRoom(v) { try { localStorage.setItem("mw:room", v); } catch {} }
 
+/* ---- Supabase client (anon key is safe to expose — RLS controls access) ---- */
+function getSB() {
+  const url = import.meta.env.VITE_SUPABASE_URL;
+  const key = import.meta.env.VITE_SUPABASE_ANON_KEY;
+  if (!url || !key) throw new Error("VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY not set in environment");
+  return createClient(url, key);
+}
+
 /* ---- shared backend ---- */
-async function api(method, body) {
+async function getState() {
+  const sb = getSB();
+  const { data, error } = await sb.from("meanwhile_state").select("*").eq("id", 1).single();
+  if (error && error.code !== "PGRST116") throw error;
+  return data ? { posts: data.posts || [], stamps: data.stamps || [] } : { posts: [], stamps: [] };
+}
+
+async function sendOp(type, payload) {
   const res = await fetch("/api/state", {
-    method,
+    method: "POST",
     headers: { "Content-Type": "application/json", "x-room": getRoom() },
-    body: body ? JSON.stringify(body) : undefined,
+    body: JSON.stringify({ type, payload }),
   });
   if (res.status === 401) { const e = new Error("locked"); e.code = 401; throw e; }
   if (!res.ok) throw new Error("request failed");
   return res.json();
 }
-const getState = () => api("GET");
-const sendOp = (type, payload) => api("POST", { type, payload });
 
 /* ---- media ---- */
 function readDataURL(file) {
@@ -259,40 +281,33 @@ async function uploadMedia(file, onProgress) {
   const isImage = file.type.startsWith("image/");
   if (!isVideo && !isImage) throw new Error("Pick a photo or a video.");
 
-  let body = file;
+  const sb = getSB();
+  const ext = isVideo ? (file.name.split(".").pop() || "mp4") : "jpg";
+  const path = `media/${uid()}-${safe(file.name || "upload")}.${ext}`;
+
+  let uploadFile = file;
   let contentType = file.type || "application/octet-stream";
-  const filename = uid() + "-" + safe(file.name || "upload");
 
   if (isImage) {
     try {
       const dataUrl = await shrinkImage(await readDataURL(file));
-      body = await (await fetch(dataUrl)).blob();
+      uploadFile = await (await fetch(dataUrl)).blob();
       contentType = "image/jpeg";
     } catch {}
   }
 
   onProgress && onProgress({ percentage: 10 });
 
-  const res = await fetch("/api/upload", {
-    method: "POST",
-    headers: {
-      "Content-Type": contentType,
-      "x-filename": filename,
-      "x-room": getRoom(),
-    },
-    body,
-  });
+  const { data, error } = await sb.storage
+    .from("meanwhile-media")
+    .upload(path, uploadFile, { contentType, upsert: false });
 
-  onProgress && onProgress({ percentage: 90 });
+  if (error) throw new Error(error.message || "Upload failed");
 
-  if (!res.ok) {
-    const err = await res.json().catch(function() { return {}; });
-    throw new Error(err.error || "Upload failed");
-  }
-
-  const data = await res.json();
   onProgress && onProgress({ percentage: 100 });
-  return { mediaType: isVideo ? "video" : "image", media: data.url };
+
+  const { data: { publicUrl } } = sb.storage.from("meanwhile-media").getPublicUrl(data.path);
+  return { mediaType: isVideo ? "video" : "image", media: publicUrl };
 }
 
 /* ---- doodle shapes ---- */
@@ -413,7 +428,11 @@ export default function App() {
   const [composing, setComposing] = useState(false);
   const [editing, setEditing] = useState(false);
   const [pasteMode, setPasteMode] = useState(false);
-  const busyRef = useRef(false);
+  // pendingRef counts in-flight ops; lastOpAt tracks when we last wrote
+  // so the poll never overwrites local state with stale server data.
+  const pendingRef = useRef(0);
+  const lastOpAt = useRef(0);
+  const STALE_MS = 4000; // ignore poll results for 4 s after any write
 
   const applyState = useCallback((s) => {
     setPosts((s.posts || []).slice().sort((a, b) => (b.ts || 0) - (a.ts || 0)));
@@ -421,24 +440,28 @@ export default function App() {
   }, []);
 
   const refresh = useCallback(async () => {
-    if (busyRef.current) return;
+    // Don't let a background poll clobber state while a write is in flight
+    // or for a few seconds after one completes.
+    if (pendingRef.current > 0) return;
+    if (Date.now() - lastOpAt.current < STALE_MS) return;
     try { applyState(await getState()); setLocked(false); }
     catch (e) { if (e.code === 401) setLocked(true); }
   }, [applyState]);
 
   useEffect(() => {
     (async () => { await refresh(); setLoading(false); })();
-    const iv = setInterval(refresh, 5000);
+    const iv = setInterval(refresh, 6000);
     const onFocus = () => refresh();
     window.addEventListener("focus", onFocus);
     return () => { clearInterval(iv); window.removeEventListener("focus", onFocus); };
   }, [refresh]);
 
   const op = useCallback(async (type, payload) => {
-    busyRef.current = true;
-    try { applyState(await sendOp(type, payload)); }
+    pendingRef.current += 1;
+    lastOpAt.current = Date.now();
+    try { applyState(await sendOp(type, payload)); lastOpAt.current = Date.now(); }
     catch (e) { if (e.code === 401) setLocked(true); }
-    finally { busyRef.current = false; }
+    finally { pendingRef.current = Math.max(0, pendingRef.current - 1); }
   }, [applyState]);
 
   const saveProfile = useCallback((p) => {
@@ -486,10 +509,13 @@ export default function App() {
   }, [op]);
 
   const other = useMemo(() => {
+    // Exclude every name this device has ever used (handles renames cleanly).
+    const myNames = loadMyNames();
+    if (me?.name) myNames.add(me.name);
     const names = new Set();
     posts.forEach((p) => { names.add(p.author); (p.comments || []).forEach((c) => names.add(c.author)); });
     stamps.forEach((s) => names.add(s.author));
-    names.delete(me?.name);
+    myNames.forEach((n) => names.delete(n));
     return [...names][0] || null;
   }, [posts, stamps, me]);
 
