@@ -1,4 +1,13 @@
 {
+  "functions": {
+    "api/upload.js": {
+      "maxDuration": 30,
+      "memory": 1024
+    },
+    "api/state.js": {
+      "maxDuration": 15
+    }
+  },
   "rewrites": [
     { "source": "/api/state", "destination": "/api/state" },
     { "source": "/api/upload", "destination": "/api/upload" },
