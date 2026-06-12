@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { Plus, Heart, X, MapPin, Trash2, Camera, Loader2, Moon, Send, Sticker, Check, Lock } from "lucide-react";
-import { upload } from "@vercel/blob/client";
 
 /* ------------------------------------------------------------------ *
  * Meanwhile — a soft little window for two.
@@ -259,21 +258,41 @@ async function uploadMedia(file, onProgress) {
   const isVideo = file.type.startsWith("video/");
   const isImage = file.type.startsWith("image/");
   if (!isVideo && !isImage) throw new Error("Pick a photo or a video.");
-  if (isVideo) {
-    const b = await upload(`media/${uid()}-${safe(file.name)}`, file, {
-      access: "public", handleUploadUrl: "/api/upload", multipart: true, onUploadProgress: onProgress,
-    });
-    return { mediaType: "video", media: b.url };
+
+  let body = file;
+  let contentType = file.type || "application/octet-stream";
+  const filename = uid() + "-" + safe(file.name || "upload");
+
+  if (isImage) {
+    try {
+      const dataUrl = await shrinkImage(await readDataURL(file));
+      body = await (await fetch(dataUrl)).blob();
+      contentType = "image/jpeg";
+    } catch {}
   }
-  let body, name = `media/${uid()}.jpg`, contentType = "image/jpeg";
-  try {
-    const dataUrl = await shrinkImage(await readDataURL(file));
-    body = await (await fetch(dataUrl)).blob();
-  } catch {
-    body = file; name = `media/${uid()}-${safe(file.name)}`; contentType = file.type || undefined;
+
+  onProgress && onProgress({ percentage: 10 });
+
+  const res = await fetch("/api/upload", {
+    method: "POST",
+    headers: {
+      "Content-Type": contentType,
+      "x-filename": filename,
+      "x-room": getRoom(),
+    },
+    body,
+  });
+
+  onProgress && onProgress({ percentage: 90 });
+
+  if (!res.ok) {
+    const err = await res.json().catch(function() { return {}; });
+    throw new Error(err.error || "Upload failed");
   }
-  const b = await upload(name, body, { access: "public", handleUploadUrl: "/api/upload", contentType, onUploadProgress: onProgress });
-  return { mediaType: "image", media: b.url };
+
+  const data = await res.json();
+  onProgress && onProgress({ percentage: 100 });
+  return { mediaType: isVideo ? "video" : "image", media: data.url };
 }
 
 /* ---- doodle shapes ---- */
